@@ -127,6 +127,13 @@ class Keyboard:
         self.require_writable()
         return self.profile.codec.encode(colors)
 
+    def start_stream(self, config):
+        self.require_writable()
+
+    def restore_stream(self, config, palette):
+        self.write_config(config)
+        self.verify(config, palette)
+
     def identification(self):
         return {"device": str(self.path), "usb_id": "258a:010c", "transport": "wired-usb",
                 "identity": self.identity.hex(" "),
@@ -296,10 +303,12 @@ def parse_color(value):
 
 def main():
     from aula_aurora import LIVE_LABELS
+    from keyboard_device import connect_keyboard, device_paths
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--device", type=Path, help="Wired vendor hidraw path from scan; required with multiple keyboards")
+    parser.add_argument("--device", type=Path, help="RGB hidraw path from scan; required with multiple interfaces")
+    parser.add_argument("--model", choices=['f87'], help="Explicit paired model for a wireless receiver; wired models are detected")
     actions = parser.add_subparsers(dest="action", required=True)
-    actions.add_parser("scan", help="Identify wired candidates without changing lighting")
+    actions.add_parser("scan", help="Inspect wired keyboards and wireless receivers without changing lighting")
     actions.add_parser("info", help="Read identity and lighting settings")
     settings = actions.add_parser("set", help="Back up, apply lighting, and verify read-back")
     settings.add_argument("--effect", choices=EFFECTS, default="solid")
@@ -330,9 +339,9 @@ def main():
     try:
         if args.action == "scan":
             results = []
-            for path in discover_all():
+            for path in device_paths():
                 try:
-                    with Keyboard(path) as keyboard:
+                    with connect_keyboard(path, model=args.model) as keyboard:
                         results.append(keyboard.identification())
                 except (DeviceError, OSError) as error:
                     results.append({"device": str(path), "writable": False, "error": str(error)})
@@ -340,7 +349,7 @@ def main():
             return 0
         if args.action == "gui":
             from aula_gui import run
-            return run(device=args.device)
+            return run(device=args.device, model=args.model)
         if args.action in {"animate", "project"}:
             from aula_aurora import LiveSession
             if args.duration < 0:
@@ -354,10 +363,12 @@ def main():
                     effect="video" if args.video else "screen",
                     vividness=args.vividness,
                     device=args.device,
+                    model=args.model,
                     source=str(args.video) if args.video else
                            args.output if args.output is not None else "" if args.screenshots else None)
             else:
-                session = LiveSession(args.color, args.brightness, args.speed, effect=args.effect, device=args.device)
+                session = LiveSession(args.color, args.brightness, args.speed, effect=args.effect,
+                                      device=args.device, model=args.model)
             try:
                 print(json.dumps(session.start(), indent=2))
                 deadline = time.monotonic() + args.duration if args.duration else float("inf")
@@ -368,7 +379,7 @@ def main():
             finally:
                 session.stop()
             return 0
-        with Keyboard(args.device) as keyboard:
+        with connect_keyboard(args.device, model=args.model) as keyboard:
             if args.action == "info":
                 result = keyboard.state()
             elif args.action == "set":

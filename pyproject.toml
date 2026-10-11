@@ -36,4 +36,5 @@ py-modules = [
     "chamak_chhallo", "aula", "aula_gui", "aula_live", "aula_aurora",
     "aula_supernova", "aula_projection", "aula_screencast",
     "keyboard_profiles", "keyboard_layouts",
+    "aula_wireless", "wireless_keyboard", "keyboard_device",
 ]

@@ -8,12 +8,19 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, GLib, Gtk
 
-from aula import ANIMATED_EFFECTS, EFFECT_LABELS, Keyboard, parse_color
+from aula import ANIMATED_EFFECTS, EFFECT_LABELS, parse_color
+from keyboard_device import DeviceSelection, device_options, connect_keyboard as Keyboard
 from aula_live import LatestChangeQueue
 from aula_aurora import LIVE_HINTS, LIVE_LABELS, LAYOUT, LiveSession
 
 
 PROJECTIONS = {"video", "screen"}
+
+
+def panel_effects(transport):
+    labels = {**EFFECT_LABELS, **LIVE_LABELS}
+    labels.pop("solid" if transport == "wireless-2.4g" else "wireless-solid")
+    return labels
 
 
 def projection_status(result):
@@ -37,10 +44,11 @@ def draw_keyboard(context, width, height, colors, layout=LAYOUT):
         context.fill()
 
 
-def run(device=None):
+def run(device=None, model=None):
     app = Adw.Application(application_id="local.chamakchhallo.Lighting")
     executor = ThreadPoolExecutor(max_workers=1)
     active_session = [None]
+    connection = DeviceSelection(device, model)
 
     def stop_stream():
         session, active_session[0] = active_session[0], None
@@ -49,12 +57,14 @@ def run(device=None):
 
     def call_keyboard(operation):
         stop_stream()
-        with Keyboard(device) as keyboard:
+        if connection.device is None:
+            return {"selection_required": True}
+        with Keyboard(connection.device, model=connection.model) as keyboard:
             return operation(keyboard)
 
     def read_state():
         session = active_session[0]
-        if session and session.running:
+        if session and session.running and not session.stopped.is_set():
             return session.state()
         return call_keyboard(lambda keyboard: keyboard.state())
 
@@ -66,7 +76,14 @@ def run(device=None):
         window.set_default_size(500, 580)
         window.set_size_request(380, 480)
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        outer.append(Adw.HeaderBar())
+        header = Adw.HeaderBar()
+        devices = Gtk.DropDown(model=Gtk.StringList.new(["Choose keyboard…"]))
+        devices.set_tooltip_text("Choose the keyboard or wireless dongle to control")
+        devices.update_property([Gtk.AccessibleProperty.LABEL], ["Keyboard connection"])
+        header.set_title_widget(devices)
+        rescan = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Refresh connected keyboards")
+        header.pack_end(rescan)
+        outer.append(header)
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=20,
                        margin_top=24, margin_bottom=24, margin_start=24, margin_end=24)
         clamp = Adw.Clamp(maximum_size=600, child=page)
@@ -80,9 +97,16 @@ def run(device=None):
         description = Gtk.Label(label="Changes apply automatically as you adjust the controls.",
                                 xalign=0, wrap=True)
         page.append(description)
+        connection_group = Adw.PreferencesGroup()
+        paired_model = Adw.ComboRow(title="Paired keyboard",
+            subtitle="The dongle cannot detect its model. Select the keyboard you own.",
+            model=Gtk.StringList.new(["Read-only inspection", "AULA F87 (experimental)"]))
+        connection_group.add(paired_model)
+        connection_group.set_visible(False)
+        page.append(connection_group)
         group = Adw.PreferencesGroup()
         page.append(group)
-        labels = {**EFFECT_LABELS, **LIVE_LABELS}
+        labels = panel_effects("wired-usb")
         effect_names = list(labels)
         effect = Adw.ComboRow(title="Effect", model=Gtk.StringList.new(list(labels.values())))
         group.add(effect)
@@ -187,30 +211,102 @@ def run(device=None):
         syncing = [True]
         closing = [False]
         writable = [False]
+        wireless = [False]
+        selecting = [False]
+        connection_pending = [False]
+        rebuild_pending = [False]
+
+        def update_connection_controls(rebuild=False):
+            selecting[0] = True
+            try:
+                if rebuild:
+                    devices.set_model(Gtk.StringList.new(["Choose keyboard…", *[item.label for item in connection.options]]))
+                paths = [item.path for item in connection.options]
+                devices.set_selected(paths.index(connection.device) + 1 if connection.device in paths else 0)
+                connection_group.set_visible(connection.wireless)
+                paired_model.set_selected(1 if connection.model == 'f87' else 0)
+                devices.set_tooltip_text(str(connection.device) if connection.device else
+                                         "Choose the keyboard or wireless dongle to control")
+            finally:
+                selecting[0] = False
+
+        def connection_changed():
+            connection_pending[0] = False
+            if closing[0]:
+                return GLib.SOURCE_REMOVE
+            writable[0] = False
+            group.set_sensitive(False)
+            last_backup[0] = None
+            updates.pending = None
+            if video_dialog[0]:
+                video_dialog[0].destroy()
+                video_dialog[0] = None
+            if active_session[0]:
+                active_session[0].request_stop()
+            preview.queue_draw()
+            update_connection_controls(rebuild=rebuild_pending[0])
+            rebuild_pending[0] = False
+            perform(read_state, True, "Current settings read.")
+            return GLib.SOURCE_REMOVE
+
+        def queue_connection_change(rebuild=False):
+            writable[0] = False
+            rebuild_pending[0] |= rebuild
+            # GTK uses selection objects after notify::selected returns
+            if not connection_pending[0]:
+                connection_pending[0] = True
+                GLib.idle_add(connection_changed)
+
+        def choose_device(*_):
+            if selecting[0] or busy[0]:
+                return
+            index = devices.get_selected()
+            if index > len(connection.options):
+                return
+            connection.choose(connection.options[index - 1].path if index else None)
+            queue_connection_change()
+
+        def choose_model(*_):
+            if selecting[0] or busy[0] or not connection.wireless:
+                return
+            connection.choose_model('f87' if paired_model.get_selected() == 1 else None)
+            queue_connection_change()
+
+        def scan_devices(*_):
+            if busy[0]:
+                return
+            connection.refresh(device_options())
+            queue_connection_change(rebuild=True)
 
         def selection_changed(*_):
-            selected = effect_names[effect.get_selected()]
+            index = effect.get_selected()
+            if index >= len(effect_names):
+                return
+            selected = effect_names[index]
+            is_live = selected in LIVE_LABELS
+            is_projection = selected in PROJECTIONS
             video_row.set_visible(selected == "video")
             screen_row.set_visible(selected == "screen")
-            vivid_row.set_visible(selected in PROJECTIONS)
-            preview_label.set_visible(selected in LIVE_LABELS)
-            preview.set_visible(selected in LIVE_LABELS)
-            row.set_sensitive(selected == "solid" or selected in LIVE_LABELS and selected not in PROJECTIONS)
-            row.set_subtitle("Colors come from the source" if selected in PROJECTIONS else
-                             "Starting color of the animation" if selected in LIVE_LABELS
+            vivid_row.set_visible(is_projection)
+            preview_label.set_visible(is_live)
+            preview.set_visible(is_live)
+            row.set_sensitive(selected == "solid" or is_live and not is_projection)
+            row.set_subtitle("Colors come from the source" if is_projection else
+                             "Starting color of the animation" if is_live and selected != "wireless-solid"
                              else "Used by solid color")
             bright_row.set_sensitive(selected != "off")
             speed_row.set_sensitive(selected in ANIMATED_EFFECTS or
-                                    selected in LIVE_LABELS and selected not in PROJECTIONS)
+                                    is_live and not is_projection and selected != "wireless-solid")
             speed_row.set_subtitle("Video plays at its original speed" if selected == "video" else
+                                   "Wireless keyboard targets 4 FPS" if selected == "screen" and wireless[0] else
                                    "Smooth capture targets 25 FPS" if selected == "screen" else
                                    "Used by animated effects")
-            effect.set_subtitle(LIVE_HINTS[selected] if selected in LIVE_LABELS
+            effect.set_subtitle(LIVE_HINTS[selected] if is_live
                                 else "Press keys to see this effect" if selected in {"reactive", "ripple"}
                                 else "Built-in multicolor animation" if selected in ANIMATED_EFFECTS
                                 else "")
             note.set_text("Keep this window open for live animation. Closing it restores your previous lighting."
-                          if selected in LIVE_LABELS else
+                          if is_live else
                           "Settings stay on the keyboard. Each change saves a local backup.")
 
         effect.connect("notify::selected", selection_changed)
@@ -220,35 +316,57 @@ def run(device=None):
             if closing[0]:
                 return GLib.SOURCE_REMOVE
             busy[0] = False
+            devices.set_sensitive(True)
+            rescan.set_sensitive(True)
+            paired_model.set_sensitive(True)
             group.set_sensitive(writable[0])
             try:
                 result = future.result()
+                if result.get("selection_required"):
+                    writable[0] = False
+                    group.set_sensitive(False)
+                    description.set_text("Choose a keyboard in the top bar.")
+                    status.remove_css_class("error")
+                    status.set_text("Choose which connection to control in the top bar."
+                                    if connection.options else
+                                    "Connect a keyboard or dongle, then refresh the device list in the top bar.")
+                    return GLib.SOURCE_REMOVE
                 writable[0] = result.get("writable", False)
+                wireless[0] = result.get("transport") == "wireless-2.4g"
                 group.set_sensitive(writable[0])
                 description.set_text(result.get("model") or "Keyboard lighting")
                 if not writable[0]:
-                    status.set_text(f"{result['model']}\n{result.get('note', 'Read-only device')}\n{result['device']}")
+                    message = ("Choose AULA F87 in Paired keyboard if that is your keyboard."
+                               if wireless[0] else result.get('note', 'Read-only device'))
+                    status.set_text(f"{result['model']}\n{message}\n{result['device']}")
                     refresh.set_sensitive(True)
                     restore.set_sensitive(False)
                     return GLib.SOURCE_REMOVE
                 if "backup" in result:
                     last_backup[0] = result["backup"]
+                labels = panel_effects(result.get("transport"))
+                if effect_names != list(labels):
+                    syncing[0] = True
+                    effect_names[:] = labels
+                    effect.set_model(Gtk.StringList.new(list(labels.values())))
                 if sync_controls:
                     syncing[0] = True
                     known = {name: index for index, name in enumerate(effect_names)}
                     if result["effect"] in known:
                         effect.set_selected(known[result["effect"]])
-                    color.set_text(result["color"])
+                    if result.get("color"):
+                        color.set_text(result["color"])
                     brightness.set_value(result.get("brightness", 3))
                     speed.set_value(result.get("speed", 2))
                     vividness.set_value(result.get("vividness", 100))
+                selection_changed()
                 status.remove_css_class("error")
                 if result.get("streaming"):
                     if result["effect"] in PROJECTIONS:
                         status.set_text(projection_status(result))
                     else:
                         reactions = (LIVE_HINTS[result["effect"]]
-                                 if result["typing_reactions"] else
+                                 if result["typing_reactions"] or result["effect"] == "wireless-solid" else
                                  "Animation is running. Keypress access is unavailable.")
                         status.set_text(f"{LIVE_LABELS[result['effect']]} is live.\n{reactions}\nTyping is never saved.")
                 else:
@@ -258,16 +376,19 @@ def run(device=None):
                 status.set_text(str(error))
             finally:
                 syncing[0] = False
-            if live:
-                updates.complete()
-            refresh.set_sensitive(not busy[0])
-            restore.set_sensitive(last_backup[0] is not None and not busy[0])
+                if live:
+                    updates.complete()
+                refresh.set_sensitive(not busy[0] and connection.device is not None)
+                restore.set_sensitive(writable[0] and last_backup[0] is not None and not busy[0])
             return GLib.SOURCE_REMOVE
 
         def perform(operation, sync_controls=False, success="Settings verified.", live=False):
             if busy[0]:
                 return
             busy[0] = True
+            devices.set_sensitive(False)
+            rescan.set_sensitive(False)
+            paired_model.set_sensitive(False)
             group.set_sensitive(live)
             refresh.set_sensitive(False)
             restore.set_sensitive(False)
@@ -291,7 +412,7 @@ def run(device=None):
                         return session.state()
                     stop_stream()
                     session = LiveSession(*settings[1:4], effect=settings[0], source=settings[4],
-                                          vividness=settings[5], device=device)
+                                          vividness=settings[5], device=connection.device, model=connection.model)
                     active_session[0] = session
                     return session.start()
                 return call_keyboard(lambda keyboard: keyboard.apply(*settings[:4]))
@@ -303,7 +424,10 @@ def run(device=None):
         def apply_changed(*_):
             if syncing[0] or not writable[0]:
                 return
-            selected = effect_names[effect.get_selected()]
+            index = effect.get_selected()
+            if index >= len(effect_names):
+                return
+            selected = effect_names[index]
             session = active_session[0]
             if session and session.effect != selected:
                 session.request_stop()
@@ -367,6 +491,9 @@ def run(device=None):
                     True, "Previous settings restored.")
 
         restore.connect("clicked", restore_clicked)
+        devices.connect("notify::selected", choose_device)
+        paired_model.connect("notify::selected", choose_model)
+        rescan.connect("clicked", scan_devices)
 
         def close_requested(*_):
             closing[0] = True
@@ -405,7 +532,7 @@ def run(device=None):
 
         GLib.timeout_add(40, update_preview)
         window.present()
-        perform(read_state, True, "Current settings read.")
+        scan_devices()
 
     app.connect("activate", activate)
     try:

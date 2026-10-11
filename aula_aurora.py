@@ -7,19 +7,22 @@ from pathlib import Path
 import threading
 import time
 
-from aula import DeviceError, Keyboard, parse_color
+from aula import DeviceError, parse_color
+from keyboard_device import connect_keyboard as Keyboard
 from aula_supernova import Supernova
 from keyboard_layouts import F87_LAYOUT
 from keyboard_profiles import WIRED_RGB
 
 
 LIVE_LABELS = {"aurora": "Aurora + key ripples", "supernova": "Supernova",
-               "video": "Video projection", "screen": "Screen projection"}
+               "video": "Video projection", "screen": "Screen projection",
+               "wireless-solid": "Solid color over dongle"}
 LIVE_HINTS = {
     "aurora": "Type anywhere to send ripples through the aurora.",
     "supernova": "Type to feed gravity. Space explodes. Backspace reverses spin.",
     "video": "Choose a video. Its colors and motion play across the keys.",
     "screen": "Mirror a display's colors onto the keys while this window is open.",
+    "wireless-solid": "Keep the panel open for wireless color. Closing it restores previous lighting.",
 }
 
 
@@ -71,8 +74,20 @@ class Aurora:
         return WIRED_RGB.encode(self.render(now, color, brightness, speed))
 
 
+class Solid:
+    def __init__(self, layout):
+        self.layout = layout
+
+    def press(self, *_):
+        pass
+
+    def render(self, now, color, brightness, speed):
+        rgb = bytes(round(channel * brightness / 4) for channel in parse_color(color))
+        return {position[0]: rgb for position in self.layout.values()}
+
+
 class KeyInput:
-    def __init__(self, *, layout=None, usb_parent=None):
+    def __init__(self, *, layout=None, usb_parent=None, usb_id="258a:010c"):
         self.devices = []
         self.names = {}
         try:
@@ -80,6 +95,7 @@ class KeyInput:
         except ImportError:
             return
         self.ev_key = evdev.ecodes.EV_KEY
+        vendor, product = usb_id.lower().split(":")
         layout = F87_LAYOUT if layout is None else layout
         self.names = {getattr(evdev.ecodes, "KEY_" + name): name for name in layout
                       if hasattr(evdev.ecodes, "KEY_" + name)}
@@ -89,8 +105,8 @@ class KeyInput:
                 if usb_parent is not None and Path(usb_parent) not in (entry / "device").resolve().parents:
                     continue
                 identity = entry / "device/id"
-                if ((identity / "vendor").read_text().strip() != "258a"
-                        or (identity / "product").read_text().strip() != "010c"
+                if ((identity / "vendor").read_text().strip() != vendor
+                        or (identity / "product").read_text().strip() != product
                         or (identity / "bustype").read_text().strip() != "0003"):
                     continue
                 device = evdev.InputDevice(str(Path("/dev/input") / entry.name))
@@ -120,12 +136,15 @@ class KeyInput:
 
 
 class LiveSession:
-    def __init__(self, color, brightness, speed, *, effect="aurora", source=None, vividness=100, device=None):
+    def __init__(self, color, brightness, speed, *, effect="aurora", source=None, vividness=100,
+                 device=None, model=None):
         if effect not in LIVE_LABELS:
             raise ValueError(f"Unknown live animation: {effect}")
         self.effect = effect
         self.selected_device = device
+        self.selected_model = model
         self.profile = None
+        self.transport = None
         self.source_name = source
         self.image_source = None
         if effect in {"video", "screen"}:
@@ -177,6 +196,7 @@ class LiveSession:
                 "backup": str(self.backup), "device": str(self.device),
                 "model": self.profile.name if self.profile else None,
                 "profile": self.profile.key if self.profile else None,
+                "transport": self.transport,
                 "writable": bool(self.profile and self.profile.writable),
                 "source": source_label if self.image_source else None,
                 "capture_fps": self.image_source.fps() if self.image_source else None,
@@ -227,12 +247,17 @@ class LiveSession:
                     raise
             if self.stopped.is_set():
                 return
-            with Keyboard(self.selected_device) as keyboard:
+            with Keyboard(self.selected_device, model=self.selected_model) as keyboard:
                 keyboard.require_writable()
                 self.profile = keyboard.profile
+                self.transport = keyboard.identification()['transport']
                 layout = self.profile.layout
                 if self.image_source:
                     animation = Projection(layout, self.image_source)
+                elif self.effect == 'wireless-solid':
+                    if self.transport != 'wireless-2.4g':
+                        raise ValueError('Use set --effect solid for a wired keyboard.')
+                    animation = Solid(layout)
                 elif self.effect == "aurora":
                     animation = Aurora(time.monotonic(), layout=layout)
                 else:
@@ -240,9 +265,11 @@ class LiveSession:
                 config, palette = keyboard.read_config(), keyboard.read_palette()
                 self.backup = keyboard.backup(config, palette)
                 self.device = keyboard.path
+                keyboard.start_stream(config)
                 try:
-                    if not self.image_source:
-                        inputs = KeyInput(layout=layout, usb_parent=keyboard.usb_parent)
+                    if not self.image_source and self.effect != 'wireless-solid':
+                        inputs = KeyInput(layout=layout, usb_parent=keyboard.usb_parent,
+                                          usb_id=keyboard.identification()['usb_id'])
                         self.typing_reactions = bool(inputs.devices)
                     while not self.stopped.is_set():
                         started = time.monotonic()
@@ -254,19 +281,22 @@ class LiveSession:
                         colors = (animation.render(started, *settings, vividness=vividness)
                                   if self.image_source else animation.render(started, *settings))
                         frame = keyboard.encode_colors(colors)
-                        keyboard.send_direct(frame)
+                        sent = keyboard.send_direct(frame)
                         with self.lock:
                             self.last_frame = bytes(frame)
-                            self.last_colors = colors
-                            self.frame_times.append(time.monotonic())
-                        self.frames_sent += 1
+                            self.last_colors = getattr(keyboard, 'rendered_colors', None) or colors
+                            if sent is not False:
+                                self.frame_times.append(time.monotonic())
+                        if sent is not False:
+                            self.frames_sent += 1
                         self.ready.set()
                         self.stopped.wait(max(0, 1 / self.profile.fps - (time.monotonic() - started)))
                 finally:
-                    keyboard.write_config(config)
-                    keyboard.verify(config, palette)
+                    keyboard.restore_stream(config, palette)
         except Exception as error:
-            self.error = f"{LIVE_LABELS[self.effect]} stopped: {error}. Original settings backup: {self.backup}."
+            backup_note = (f"Original settings backup: {self.backup}." if self.backup is not None
+                           else "No lighting settings were changed.")
+            self.error = f"{LIVE_LABELS[self.effect]} stopped: {error}. {backup_note}"
         finally:
             if inputs:
                 inputs.close()

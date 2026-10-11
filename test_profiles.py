@@ -13,8 +13,79 @@ from aula_aurora import Aurora, LiveSession
 from aula_projection import Projection, SIZE
 from aula_supernova import Supernova
 from keyboard_profiles import F75, F87, WIRED_RGB, WiredRGBCodec, profile_for
+from keyboard_device import DeviceOption, DeviceSelection, device_options
 from test_aula import SimulatedKeyboard
 from test_aurora import StreamingKeyboard
+
+
+class DeviceSelectionTests(unittest.TestCase):
+    wired = DeviceOption(Path('/dev/hidraw8'), 'wired-usb')
+    radio = DeviceOption(Path('/dev/hidraw5'), 'wireless-2.4g')
+
+    def test_discovery_lists_both_connections_without_opening_usb(self):
+        with patch('keyboard_device.discover_all', return_value=[self.wired.path]), \
+                patch('keyboard_device.discover_receivers', return_value=[self.radio.path]), \
+                patch('keyboard_device.Keyboard') as wired, \
+                patch('keyboard_device.WirelessKeyboard') as radio:
+            self.assertEqual([self.wired, self.radio], device_options())
+            wired.assert_not_called()
+            radio.assert_not_called()
+        self.assertIn('Wired USB', self.wired.label)
+        self.assertIn('2.4G dongle', self.radio.label)
+
+    def test_multiple_connections_wait_for_selection_instead_of_guessing(self):
+        selection = DeviceSelection()
+        selection.refresh([self.wired, self.radio])
+        self.assertIsNone(selection.device)
+        selection.choose(self.radio.path)
+        self.assertEqual(self.radio.path, selection.device)
+        self.assertTrue(selection.wireless)
+        self.assertIsNone(selection.model)
+        selection.choose_model('f87')
+        self.assertEqual('f87', selection.model)
+
+    def test_one_connection_is_selected_and_cli_selection_is_preserved(self):
+        selection = DeviceSelection(model='f87')
+        selection.refresh([self.radio])
+        self.assertEqual((self.radio.path, 'f87'), (selection.device, selection.model))
+        selection = DeviceSelection(self.radio.path, 'f87')
+        selection.refresh([self.wired, self.radio])
+        self.assertEqual((self.radio.path, 'f87'), (selection.device, selection.model))
+
+    def test_model_choice_does_not_follow_a_switch_to_another_keyboard(self):
+        selection = DeviceSelection(self.radio.path, 'f87')
+        selection.refresh([self.wired, self.radio])
+        selection.choose(self.wired.path)
+        self.assertFalse(selection.wireless)
+        self.assertIsNone(selection.model)
+        with self.assertRaises(aula.DeviceError):
+            selection.choose_model('f87')
+        selection.choose(self.radio.path)
+        self.assertIsNone(selection.model)
+        with self.assertRaises(aula.DeviceError):
+            selection.choose_model('f75')
+
+    def test_rescan_preserves_present_selection_and_never_retargets_a_missing_device(self):
+        selection = DeviceSelection(self.radio.path, 'f87')
+        selection.refresh([self.wired, self.radio])
+        selection.refresh([self.radio, self.wired])
+        self.assertEqual((self.radio.path, 'f87'), (selection.device, selection.model))
+        selection.refresh([self.wired])
+        self.assertIsNone(selection.device)
+        self.assertIsNone(selection.model)
+        with self.assertRaises(aula.DeviceError):
+            selection.choose(self.radio.path)
+        self.assertIsNone(selection.device)
+
+    def test_empty_list_and_explicit_deselection_leave_no_target(self):
+        selection = DeviceSelection()
+        selection.refresh([])
+        self.assertIsNone(selection.device)
+        selection.refresh([self.radio])
+        selection.choose_model('f87')
+        selection.choose(None)
+        self.assertIsNone(selection.device)
+        self.assertIsNone(selection.model)
 
 
 class ProfileTests(unittest.TestCase):
@@ -92,7 +163,7 @@ class ProfileTests(unittest.TestCase):
             session = LiveSession("00c8ff", 3, 2, device="/dev/hidraw8")
             try:
                 state = session.start()
-                constructor.assert_called_once_with("/dev/hidraw8")
+                constructor.assert_called_once_with("/dev/hidraw8", model=None)
                 self.assertEqual("simulated-compact", state["profile"])
                 self.assertEqual(32, len(session.preview()))
                 self.assertEqual({0, 1}, set(session.preview_colors()))
