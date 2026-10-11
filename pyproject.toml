@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chamak-chhallo"
+version = "0.1.0"
+description = "AULA F87 RGB control for Linux: keyboard animations, video projection, and Wayland screen capture"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = ["Pillow>=9"]
+keywords = ["aula", "f87", "keyboard", "rgb", "linux", "wayland", "hidraw", "video-projection"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: X11 Applications :: GTK",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Hardware",
+]
+
+[project.optional-dependencies]
+typing = ["evdev>=1.6"]
+
+[project.urls]
+Repository = "https://github.com/Naresh-Khatri/chamak-chhallo"
+Issues = "https://github.com/Naresh-Khatri/chamak-chhallo/issues"
+
+[project.scripts]
+chamak-chhallo = "aula:main"
+
+[tool.setuptools]
+py-modules = [
+    "chamak_chhallo", "aula", "aula_gui", "aula_live", "aula_aurora",
+    "aula_supernova", "aula_projection", "aula_screencast",
+    "keyboard_profiles", "keyboard_layouts",
+]

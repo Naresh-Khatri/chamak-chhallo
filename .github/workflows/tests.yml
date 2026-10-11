@@ -1,0 +1,22 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system Python and GTK/GStreamer bindings
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 python3-pil python3-gi python3-gi-cairo \
+            gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-gstreamer-1.0 \
+            gir1.2-gst-plugins-base-1.0 gstreamer1.0-plugins-base gstreamer1.0-pipewire
+      - name: Run tests without USB or display capture
+        run: /usr/bin/python3 -m unittest -v
