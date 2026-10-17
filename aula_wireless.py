@@ -16,6 +16,10 @@ CONFIG_COUNT = 10
 REPORT_GAP = 0.013
 
 
+class ConfigReadTimeout(DeviceError):
+    pass
+
+
 def report(command, count, sequence, payload=b""):
     if len(payload) > 15:
         raise ValueError("Wireless report payload exceeds 15 bytes.")
@@ -51,9 +55,9 @@ def config_payload(frames):
 
 def config_equivalent(left, right):
     left, right = bytearray(config_payload(left)), bytearray(config_payload(right))
-    # firmware owns confirm/apply flags
-    for offset in (3, 9):
-        left[offset] = right[offset] = 0
+    # Firmware owns write-confirm byte 3. Byte 9 is custom lighting mode,
+    # so it must be preserved and checked during restoration.
+    left[3] = right[3] = 0
     return left == right
 
 
@@ -74,33 +78,44 @@ def color_payload(colors):
     return bytes(payload)
 
 
-def encode_rgb(colors):
-    """Send complete colour groups, coarsening HSV only when a frame cannot fit."""
-    colors = {index: bytes(rgb) for index, rgb in colors.items()}
+def quantize_hsv(hsv, peak, levels):
+    hues, saturations, values = levels
+    quantized = {}
+    for index, (hue, saturation, value) in hsv.items():
+        if value == 0:
+            quantized[index] = bytes(3)
+            continue
+        hue = round(hue * hues) % hues / hues
+        saturation = round(saturation * saturations) / saturations
+        value = max(1, round(value / peak * values)) / values * peak
+        quantized[index] = bytes(round(channel * 255) for channel in
+                                 colorsys.hsv_to_rgb(hue, saturation, value))
+    return quantized
+
+
+def fit_rgb_palette(colors, max_payload):
     payload = color_payload(colors)
+    if len(payload) <= max_payload:
+        return colors, payload
+    hsv = {index: colorsys.rgb_to_hsv(*(channel / 255 for channel in rgb))
+           for index, rgb in colors.items()}
+    peak = max(value for _, _, value in hsv.values())
+    for levels in ((12, 2, 4), (8, 2, 3), (6, 1, 2), (4, 1, 1)):
+        quantized = quantize_hsv(hsv, peak, levels)
+        payload = color_payload(quantized)
+        if len(payload) <= max_payload:
+            return quantized, payload
+    raise ValueError("A complete wireless RGB frame exceeds the packet budget.")
+
+
+def encode_rgb(colors, *, max_payload=196):
+    """Send complete colour groups, coarsening HSV only when a frame cannot fit."""
+    if not 14 <= max_payload <= 196:
+        raise ValueError("Wireless RGB payload budget must be between 14 and 196 bytes.")
+    colors = {index: bytes(rgb) for index, rgb in colors.items()}
+    colors, payload = fit_rgb_palette(colors, max_payload)
     if not payload:
         return b"", {}
-    if len(payload) > 196:
-        hsv = {index: colorsys.rgb_to_hsv(*(channel / 255 for channel in rgb))
-               for index, rgb in colors.items()}
-        peak = max(value for _, _, value in hsv.values())
-        for hues, saturations, values in ((12, 2, 4), (8, 2, 3), (6, 1, 2), (4, 1, 1)):
-            quantized = {}
-            for index, (hue, saturation, value) in hsv.items():
-                if value == 0:
-                    quantized[index] = bytes(3)
-                    continue
-                hue = round(hue * hues) % hues / hues
-                saturation = round(saturation * saturations) / saturations
-                value = max(1, round(value / peak * values)) / values * peak
-                quantized[index] = bytes(round(channel * 255) for channel in
-                                         colorsys.hsv_to_rgb(hue, saturation, value))
-            payload = color_payload(quantized)
-            if len(payload) <= 196:
-                colors = quantized
-                break
-        else:
-            raise ValueError("A complete wireless RGB frame exceeds the packet budget.")
     count = (len(payload) + 13) // 14
     frames = [report(0x88, count, seq, bytes((0x10 + len(chunk),)) + chunk)
               for seq, start in enumerate(range(0, len(payload), 14))
@@ -279,6 +294,14 @@ class Receiver:
             return data
 
     def read_config(self):
+        for _ in range(3):
+            try:
+                return self._read_config_once()
+            except ConfigReadTimeout as error:
+                last_error = error
+        raise last_error
+
+    def _read_config_once(self):
         self.drain()
         request = report(0x44, 1, 0)
         self.send(request)
@@ -287,7 +310,7 @@ class Receiver:
         while len(frames) < CONFIG_COUNT:
             frame = self.read(deadline)
             if frame is None:
-                raise DeviceError(f"Wireless config read timed out with {len(frames)}/10 fragments. "
+                raise ConfigReadTimeout(f"Wireless config read timed out with {len(frames)}/10 fragments. "
                                   "Check that the keyboard is awake and in 2.4G mode.")
             if frame == request:
                 continue

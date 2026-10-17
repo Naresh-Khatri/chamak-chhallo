@@ -59,7 +59,7 @@ class DeviceSelection:
         self.device = device
 
     def choose_model(self, model):
-        if not self.wireless or model not in (None, 'f87'):
+        if not self.wireless or model not in (None, 'f87', 'f75'):
             raise DeviceError('Select an available wireless keyboard model.')
         self.model = model
 

@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from types import MappingProxyType
 
-from keyboard_layouts import F87_LAYOUT
+from keyboard_layouts import F75_LAYOUT, F87_LAYOUT
 
 
 @dataclass(frozen=True)
@@ -32,6 +32,11 @@ F87_EFFECTS = MappingProxyType({
     "off": 0, "solid": 1, "breathing": 2, "rainbow": 3,
     "ripple": 7, "starlight": 8, "reactive": 12,
 })
+F75_EFFECTS = MappingProxyType({
+    **F87_EFFECTS, "spectrum": 4, "rain": 5, "color-shift": 6,
+    "snake": 9, "marquee": 10, "onboard-aurora": 11, "firework": 13,
+    "gradient": 14, "rainbow-wave": 15, "prism": 16, "cycle": 17, "tidal": 18,
+})
 
 
 @dataclass(frozen=True)
@@ -49,6 +54,13 @@ class KeyboardProfile:
     parameters_offset: int = 64
     color_offset: int = 29
     note: str = ""
+    brightness_max: int = 4
+    stream_settings: object = None
+    frame_keepalive: float = 2
+
+    @property
+    def streaming_supported(self):
+        return self.layout is not None and self.codec is not None
 
 
 F87 = KeyboardProfile(
@@ -62,7 +74,16 @@ F75 = KeyboardProfile(
     bytes.fromhex("03 00 00 00 03 66"), False,
     note="Read-only recognition. Settings offsets, LED map, and streaming need hardware validation.",
 )
-PROFILES = MappingProxyType({profile.identity: profile for profile in (F87, F75)})
+F75_CD = KeyboardProfile(
+    "aula-f75-00cd", "AULA F75 · identity 00 cd",
+    bytes.fromhex("03 00 00 00 00 cd"), True,
+    effects=F75_EFFECTS, brightness_max=9,
+    layout=MappingProxyType(F75_LAYOUT), codec=WiredRGBCodec(led_count=126), fps=20,
+    stream_settings=MappingProxyType({17: 1, 18: 21, 66: 9, 67: 0x47}),
+    frame_keepalive=0.2,
+    note="F75 onboard lighting and per-key streaming. USB streaming is limited to 20 FPS.",
+)
+PROFILES = MappingProxyType({profile.identity: profile for profile in (F87, F75, F75_CD)})
 
 
 def profile_for(identity):

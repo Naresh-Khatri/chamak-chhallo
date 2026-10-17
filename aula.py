@@ -9,19 +9,24 @@ from pathlib import Path
 import sys
 import time
 
-from keyboard_profiles import F87, F87_EFFECTS, profile_for
+from keyboard_profiles import F75_EFFECTS, F87, F87_EFFECTS, profile_for
 
 
 STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
 BACKUPS = Path(os.environ["CHAMAK_CHHALLO_BACKUPS"]) if os.environ.get(
     "CHAMAK_CHHALLO_BACKUPS") else STATE_HOME / "chamak-chhallo/backups"
 IDENTITY = F87.identity
-EFFECTS = F87_EFFECTS
+EFFECTS = {**F87_EFFECTS, **F75_EFFECTS}
 EFFECT_LABELS = {
     "solid": "Solid color", "rainbow": "Rainbow", "breathing": "Breathing",
     "reactive": "Reactive", "ripple": "Ripple", "starlight": "Starlight", "off": "Off",
+    "spectrum": "Spectrum", "rain": "Rain", "color-shift": "Color shift",
+    "snake": "Snake", "marquee": "Marquee", "onboard-aurora": "Aurora (onboard)",
+    "firework": "Firework", "gradient": "Gradient", "rainbow-wave": "Rainbow wave",
+    "prism": "Prism", "cycle": "Color cycle", "tidal": "Tidal",
 }
 ANIMATED_EFFECTS = frozenset(EFFECTS) - {"solid", "off"}
+COLORFUL_EFFECTS = ANIMATED_EFFECTS - {"gradient"}
 REPORT_SIZE = 520
 
 
@@ -112,7 +117,7 @@ class Keyboard:
             time.sleep(delay)
 
     def send_direct(self, frame):
-        self.require_writable()
+        self.require_streaming()
         codec = self.profile.codec
         if len(frame) != codec.report_size or frame[:8] != codec.header:
             raise DeviceError("Invalid temporary RGB frame.")
@@ -124,11 +129,25 @@ class Keyboard:
             raise DeviceError(f"{model} is read-only. A validated device profile is required for lighting writes.")
 
     def encode_colors(self, colors):
-        self.require_writable()
+        self.require_streaming()
         return self.profile.codec.encode(colors)
 
-    def start_stream(self, config):
+    def require_streaming(self):
         self.require_writable()
+        if not self.profile.streaming_supported:
+            raise DeviceError("Live streaming is not enabled for this keyboard revision.")
+
+    def start_stream(self, config):
+        self.require_streaming()
+        if self.profile.stream_settings:
+            changed = bytearray(config)
+            for offset, value in self.profile.stream_settings.items():
+                changed[offset] = value
+            if changed != config:
+                self.write_config(changed)
+                time.sleep(0.4)
+                if self.read_config() != changed:
+                    raise DeviceError("Per-key lighting mode did not match its read-back.")
 
     def restore_stream(self, config, palette):
         self.write_config(config)
@@ -140,6 +159,10 @@ class Keyboard:
                 "model": self.profile.name if self.profile else "Unrecognized keyboard",
                 "profile": self.profile.key if self.profile else None,
                 "writable": bool(self.profile and self.profile.writable),
+                "streaming_supported": bool(self.profile and self.profile.streaming_supported),
+                "brightness_max": self.profile.brightness_max if self.profile else 4,
+                "target_fps": self.profile.fps if self.profile else None,
+                "supported_effects": list(self.profile.effects or {}) if self.profile else [],
                 "note": self.profile.note if self.profile else "Read-only. No matching identity profile."}
 
     def query(self, request, expected_length):
@@ -223,9 +246,10 @@ class Keyboard:
         self.require_writable()
         profile = self.profile
         color = parse_color(color)
-        if effect not in profile.effects or not 0 <= brightness <= 4 or not 0 <= speed <= 4:
+        if effect not in profile.effects or not 0 <= brightness <= profile.brightness_max or not 0 <= speed <= 4:
             raise ValueError(
-                f"Choose an effect from {', '.join(EFFECTS)} and brightness/speed from 0 to 4."
+                f"Choose an effect from {', '.join(profile.effects)}, brightness from 0 to "
+                f"{profile.brightness_max}, and speed from 0 to 4."
             )
         config, palette = self.read_config(), self.read_palette()
         changed, colors = bytearray(config), bytearray(palette)
@@ -234,7 +258,7 @@ class Keyboard:
         if effect != "off":
             offset = profile.parameters_offset + 2 * profile.effects[effect]
             changed[offset] = brightness
-            changed[offset + 1] = (speed << 4) | (7 if effect in ANIMATED_EFFECTS else 0)
+            changed[offset + 1] = (speed << 4) | (7 if effect in COLORFUL_EFFECTS else 0)
         if effect == "solid":
             colors[profile.color_offset:profile.color_offset + 3] = color
         if changed == config and colors == palette:
@@ -306,14 +330,15 @@ def main():
     from keyboard_device import connect_keyboard, device_paths
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", type=Path, help="RGB hidraw path from scan; required with multiple interfaces")
-    parser.add_argument("--model", choices=['f87'], help="Explicit paired model for a wireless receiver; wired models are detected")
+    parser.add_argument("--model", choices=['f87', 'f75'], help="Explicit paired model for a wireless receiver; wired models are detected")
     actions = parser.add_subparsers(dest="action", required=True)
     actions.add_parser("scan", help="Inspect wired keyboards and wireless receivers without changing lighting")
     actions.add_parser("info", help="Read identity and lighting settings")
     settings = actions.add_parser("set", help="Back up, apply lighting, and verify read-back")
     settings.add_argument("--effect", choices=EFFECTS, default="solid")
     settings.add_argument("--color", default="00c8ff")
-    settings.add_argument("--brightness", type=int, choices=range(5), default=3)
+    settings.add_argument("--brightness", type=int, choices=range(10), default=3,
+                          help="0–4 for F87; 0–9 for supported F75 profiles")
     settings.add_argument("--speed", type=int, choices=range(5), default=2)
     restore = actions.add_parser("restore", help="Restore a settings backup")
     restore.add_argument("backup", type=Path)

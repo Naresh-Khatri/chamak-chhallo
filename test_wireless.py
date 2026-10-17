@@ -12,7 +12,7 @@ import aula
 from aula import DeviceError
 from aula_aurora import LiveSession
 from aula_wireless import Receiver, config_equivalent, config_payload, encode_rgb, report, report_sizes, validate_report, validate_rgb
-from keyboard_profiles import F87
+from keyboard_profiles import F75_CD, F87
 from wireless_keyboard import WirelessKeyboard, WirelessRGBCodec, config_key
 
 
@@ -68,12 +68,18 @@ class WirelessReadTests(unittest.TestCase):
 
     def test_missing_or_conflicting_fragments_are_rejected(self):
         frames = configuration()
-        with self.assertRaisesRegex(DeviceError, "9/10"):
+        with self.assertRaisesRegex(DeviceError, "0/10"):
             SimulatedReceiver(frames[:-1]).read_config()
         changed = bytearray(frames[0][4:19])
         changed[2] ^= 1
         with self.assertRaisesRegex(DeviceError, "Conflicting duplicate"):
             SimulatedReceiver([frames[0], report(0x44, 10, 0, changed)]).read_config()
+
+    def test_incomplete_read_restarts_without_combining_partial_snapshots(self):
+        frames = configuration()
+        receiver = SimulatedReceiver([*frames[:5], None, *frames])
+        self.assertEqual(frames, receiver.read_config())
+        self.assertEqual(2, len(receiver.sent))
 
     def test_config_tail_ignores_stale_bytes_but_still_checks_checksum_and_marker(self):
         frames = configuration()
@@ -87,6 +93,12 @@ class WirelessReadTests(unittest.TestCase):
             config_payload((*frames[:-1], damaged))
         with self.assertRaisesRegex(DeviceError, 'end marker'):
             config_payload((*frames[:-1], report(0x44, 10, 9, b'\x02\x5a\x00' + bytes(range(1, 13)))))
+
+    def test_custom_lighting_mode_is_checked_during_readback(self):
+        frames = configuration()
+        changed = bytearray(config_payload(frames))
+        changed[9] ^= 1
+        self.assertFalse(config_equivalent(frames, configuration(changed)))
 
     def test_checksums_end_markers_lengths_and_sequence_are_required(self):
         frames = configuration()
@@ -112,6 +124,17 @@ class WirelessReadTests(unittest.TestCase):
 
 
 class WirelessFrameTests(unittest.TestCase):
+    def test_f75_fast_palette_sends_all_keys_in_eight_reports(self):
+        colors = {position[0]: bytes((i * 31 % 256, i * 53 % 256, i * 79 % 256))
+                  for i, position in enumerate(F75_CD.layout.values())}
+        colors[1] = b'\x01\x00\x00'
+        packed, actual = encode_rgb(colors, max_payload=112)
+        self.assertLessEqual(len(packed), 8 * 20)
+        self.assertEqual(set(colors), set(actual))
+        self.assertEqual(actual, validate_rgb(packed))
+        for index, rgb in colors.items():
+            self.assertEqual(bool(any(rgb)), bool(any(actual[index])))
+
     def test_complete_solid_frame_crosses_fragments_and_preserves_black(self):
         colors = {index: b'\x00\xff\xff' for index in range(126)}
         colors[125] = bytes(3)
@@ -157,6 +180,7 @@ class SimulatedWirelessKeyboard(WirelessKeyboard):
         self.pending = deque()
         self.staged = []
         self.fail_echo = False
+        self.fail_save_echo = False
         self.fail_rgb = False
 
     def __enter__(self):
@@ -183,7 +207,7 @@ class SimulatedWirelessKeyboard(WirelessKeyboard):
         if frame[1] == 0x0A:
             self.config = tuple(report(0x44, 10, seq, item[4:19])
                                 for seq, item in enumerate(self.staged[-10:]))
-        if not self.fail_echo:
+        if not self.fail_echo and not (self.fail_save_echo and frame[1] == 0x0A):
             self.pending.append(frame)
 
 
@@ -212,6 +236,31 @@ class WirelessSafetyTests(unittest.TestCase):
             with self.assertRaisesRegex(DeviceError, 'changed between reads'):
                 WirelessKeyboard.__enter__(self.keyboard)
         self.assertEqual([], self.keyboard.sent)
+
+    def test_f75_selection_uses_native_brightness_and_restores_its_backup(self):
+        self.keyboard.model = 'f75'
+        with patch('aula_wireless.Receiver.__enter__'), patch('aula_wireless.Receiver.__exit__'):
+            WirelessKeyboard.__enter__(self.keyboard)
+        self.assertEqual(9, self.keyboard.profile.brightness_max)
+        self.assertEqual(8, self.keyboard.profile.fps)
+        self.assertEqual(112, self.keyboard.profile.codec.max_payload)
+        self.assertEqual(64, self.keyboard.profile.codec.report_rate)
+        self.assertTrue(self.keyboard.profile.streaming_supported)
+        original = self.keyboard.config
+        self.keyboard.fail_save_echo = True
+        result = self.keyboard.apply('breathing', 'ffffff', 9, 2)
+        self.assertEqual(9, result['brightness'])
+        self.assertEqual('f75', json.loads(Path(result['backup']).read_text())['model'])
+        self.keyboard.restore(result['backup'])
+        self.assertTrue(config_equivalent(original, self.keyboard.config))
+        self.keyboard.start_stream(self.keyboard.config)
+        streamed = config_payload(self.keyboard.config)
+        self.assertEqual((1, 21, 9, 0x47), tuple(streamed[i] for i in (9, 10, 58, 59)))
+        allowed = {3, 9, 10, 58, 59}
+        self.assertTrue(all(a == b for i, (a, b) in enumerate(zip(config_payload(original), streamed))
+                            if i not in allowed))
+        self.keyboard.restore_stream(original, None)
+        self.assertTrue(config_equivalent(original, self.keyboard.config))
 
     def test_onboard_change_preserves_unrelated_settings_and_restores_native_backup(self):
         original = config_payload(self.keyboard.config)
@@ -249,6 +298,18 @@ class WirelessSafetyTests(unittest.TestCase):
             self.keyboard.write_config(self.keyboard.config)
         self.assertEqual(1, len(self.keyboard.sent))
 
+    def test_missing_save_echo_succeeds_only_with_matching_readback(self):
+        self.keyboard.fail_save_echo = True
+        result = self.keyboard.apply('breathing', 'ffffff', 3, 2)
+        self.assertTrue(result['verified'])
+        self.keyboard.verify(self.keyboard.config)
+
+    def test_missing_save_echo_with_failed_readback_is_rejected(self):
+        self.keyboard.fail_save_echo = True
+        with patch.object(self.keyboard, 'verify', side_effect=DeviceError('read-back differs')):
+            with self.assertRaisesRegex(DeviceError, 'read-back differs'):
+                self.keyboard.write_config(self.keyboard.config)
+
     def test_config_write_zeroes_unused_tail_without_changing_settings(self):
         original = self.keyboard.config
         stale = (*original[:-1], report(0x44, 10, 9, b'\x02\x5a\xa5' + bytes(range(1, 13))))
@@ -264,7 +325,16 @@ class WirelessSafetyTests(unittest.TestCase):
     def test_failed_verification_rolls_back_before_reporting_failure(self):
         original = self.keyboard.config
         verify = self.keyboard.verify
-        with patch.object(self.keyboard, 'verify', side_effect=[DeviceError('read-back mismatch'), None]):
+        failed = False
+
+        def fail_once(config, palette=None):
+            nonlocal failed
+            if not failed:
+                failed = True
+                raise DeviceError('read-back mismatch')
+            verify(config, palette)
+
+        with patch.object(self.keyboard, 'verify', side_effect=fail_once):
             with self.assertRaisesRegex(DeviceError, 'Original settings restored'):
                 self.keyboard.apply('rainbow', 'ffffff', 2, 1)
         verify(original)
@@ -283,6 +353,30 @@ class WirelessSafetyTests(unittest.TestCase):
         self.keyboard.restore_stream(original, None)
         self.keyboard.verify(original)
 
+    def test_f75_refreshes_unchanged_solid_frames_before_they_expire(self):
+        self.keyboard.profile = replace(F75_CD, codec=WirelessRGBCodec(), fps=4)
+        frame = self.keyboard.encode_colors({position[0]: b'\x00\xff\xff'
+                                             for position in self.keyboard.profile.layout.values()})
+        with patch('wireless_keyboard.time.monotonic', side_effect=[0, 0, 0.1, 0.25, 0.25]):
+            self.assertTrue(self.keyboard.send_direct(frame))
+            self.assertFalse(self.keyboard.send_direct(frame))
+            self.assertTrue(self.keyboard.send_direct(frame))
+        self.assertEqual(2 * len(frame) // 20, len(self.keyboard.sent))
+
+    def test_f75_packet_budget_delays_next_complete_frame(self):
+        self.keyboard.profile = replace(F75_CD, codec=WirelessRGBCodec(max_payload=112, report_rate=64), fps=8)
+        colors = {position[0]: b'\x00\xff\xff' for position in F75_CD.layout.values()}
+        first = self.keyboard.encode_colors(colors)
+        colors[0] = b'\xff\x00\x00'
+        second = self.keyboard.encode_colors(colors)
+        now = [0.0]
+        with patch('wireless_keyboard.time.monotonic', side_effect=lambda: now[0]), \
+                patch('wireless_keyboard.time.sleep', side_effect=lambda delay: now.__setitem__(0, now[0] + delay)):
+            self.keyboard.send_direct(first)
+            self.keyboard.send_direct(second)
+        self.assertAlmostEqual(len(first) / 20 / 64, now[0])
+        self.assertEqual(len(first + second) // 20, len(self.keyboard.sent))
+
     def test_custom_table_cannot_be_backed_up_and_cannot_start_stream(self):
         payload = bytearray(config_payload(self.keyboard.config))
         payload[10] = 21
@@ -292,6 +386,28 @@ class WirelessSafetyTests(unittest.TestCase):
 
 
 class WirelessIntegrationTests(unittest.TestCase):
+    def test_failed_f75_mode_start_restores_original_native_settings(self):
+        keyboard = SimulatedWirelessKeyboard()
+        keyboard.model = 'f75'
+        keyboard.profile = replace(keyboard.profile, stream_settings={17: 1})
+        original = keyboard.config
+        start_stream = keyboard.start_stream
+
+        def fail_after_mode_change(config):
+            start_stream(config)
+            raise DeviceError('simulated startup failure')
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(aula, 'BACKUPS', Path(directory)), \
+                patch('aula_aurora.Keyboard', return_value=keyboard), \
+                patch.object(keyboard, 'start_stream', side_effect=fail_after_mode_change), \
+                patch('wireless_keyboard.time.sleep'):
+            session = LiveSession('00ffff', 4, 2, effect='wireless-solid', model='f75')
+            with self.assertRaisesRegex(DeviceError, 'simulated startup failure'):
+                session.start()
+        self.assertTrue(config_equivalent(original, keyboard.config))
+        self.assertNotIn(0x88, {frame[1] for frame in keyboard.sent})
+
     def test_selected_receiver_never_uses_wired_commands_and_requires_selection_if_ambiguous(self):
         import keyboard_device
         wired, wireless = Path('/dev/hidraw-wired'), Path('/dev/hidraw-wireless')
