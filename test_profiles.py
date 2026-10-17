@@ -62,8 +62,10 @@ class DeviceSelectionTests(unittest.TestCase):
             selection.choose_model('f87')
         selection.choose(self.radio.path)
         self.assertIsNone(selection.model)
+        selection.choose_model('f75')
+        self.assertEqual('f75', selection.model)
         with self.assertRaises(aula.DeviceError):
-            selection.choose_model('f75')
+            selection.choose_model('f99')
 
     def test_rescan_preserves_present_selection_and_never_retargets_a_missing_device(self):
         selection = DeviceSelection(self.radio.path, 'f87')

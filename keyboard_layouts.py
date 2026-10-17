@@ -29,3 +29,38 @@ def make_layout():
 
 
 F87_LAYOUT = make_layout()
+
+
+def make_f75_layout():
+    """F75's 80 keys, with the column-major indices reported by its matrix."""
+    layout = {}
+
+    def row(names, indices, widths, height):
+        left = 0
+        for name, index, width in zip(names.split(), indices, widths, strict=True):
+            layout[name] = (index, left + width / 2 - 0.5, height)
+            left += width
+
+    names = "ESC F1 F2 F3 F4 F5 F6 F7 F8 F9 F10 F11 F12"
+    columns = [0, 1.9, 2.9, 3.9, 4.9, 6.3, 7.3, 8.3, 9.3, 10.7, 11.7, 12.7, 13.7]
+    layout.update({name: (index, column, 0) for name, index, column in
+                   zip(names.split(), [0, *range(12, 79, 6)], columns, strict=True)})
+    row("GRAVE 1 2 3 4 5 6 7 8 9 0 MINUS EQUAL BACKSPACE DELETE",
+        [1, 7, 13, 19, 25, 31, 37, 43, 49, 55, 61, 67, 73, 79, 85],
+        [*([1] * 13), 2, 1], 1.5)
+    row("TAB Q W E R T Y U I O P LEFTBRACE RIGHTBRACE BACKSLASH PAGEUP",
+        [2, 8, 14, 20, 26, 32, 38, 44, 50, 56, 62, 68, 74, 80, 86],
+        [1.5, *([1] * 12), 1.5, 1], 2.5)
+    row("CAPSLOCK A S D F G H J K L SEMICOLON APOSTROPHE ENTER PAGEDOWN",
+        [3, 9, 15, 21, 27, 33, 39, 45, 51, 57, 63, 69, 81, 87],
+        [1.75, *([1] * 11), 2.25, 1], 3.5)
+    row("LEFTSHIFT Z X C V B N M COMMA DOT SLASH RIGHTSHIFT UP END",
+        [4, 10, 16, 22, 28, 34, 40, 46, 52, 58, 64, 70, 82, 88],
+        [2.25, *([1] * 10), 1.75, 1, 1], 4.5)
+    row("LEFTCTRL LEFTMETA LEFTALT SPACE FN RIGHTCTRL LEFT DOWN RIGHT",
+        [5, 11, 17, 35, 53, 59, 77, 83, 89],
+        [1.25, 1.25, 1.25, 6.25, 1.25, 1.75, 1, 1, 1], 5.5)
+    return layout
+
+
+F75_LAYOUT = make_f75_layout()

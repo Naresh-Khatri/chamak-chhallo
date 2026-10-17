@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 import aula_gui
 from keyboard_device import DeviceOption
-from keyboard_profiles import F87
+from keyboard_profiles import F75_CD, F87
 
 
 class Widget:
@@ -77,6 +77,12 @@ class Widget:
     def get_value_as_int(self):
         return int(self.value)
 
+    def set_range(self, lower, upper):
+        self.properties['range'] = (lower, upper)
+        clamped = max(lower, min(upper, self.value))
+        if clamped != self.value:
+            self.set_value(clamped)
+
     def add_css_class(self, name):
         self.css_classes.add(name)
 
@@ -102,7 +108,7 @@ class ImmediateExecutor:
 
 class SelectorCallbackTests(unittest.TestCase):
     def test_select_switch_and_rescan_wait_until_notification_returns(self):
-        widgets, idle, events = {}, deque(), []
+        widgets, idle, events, sessions = {}, deque(), [], []
         wired = DeviceOption(Path('/dev/hidraw7'), 'wired-usb')
         radio = DeviceOption(Path('/dev/hidraw5'), 'wireless-2.4g')
 
@@ -128,9 +134,13 @@ class SelectorCallbackTests(unittest.TestCase):
         def state(path, model):
             wireless = path == radio.path
             return {'device': str(path), 'transport': 'wireless-2.4g' if wireless else 'wired-usb',
-                    'model': 'Simulated keyboard', 'writable': not wireless or model == 'f87',
-                    'effect': 'reactive', 'color': None if wireless else '#00ffff',
-                    'brightness': 3, 'speed': 2}
+                    'model': 'Simulated keyboard', 'writable': not wireless or model in ('f87', 'f75'),
+                    'effect': 'onboard-aurora' if model == 'f75' else 'reactive',
+                    'color': None if wireless else '#00ffff',
+                    'brightness': 9 if model == 'f75' else 3 if wireless else 8, 'speed': 2,
+                    'brightness_max': 4 if wireless and model != 'f75' else 9,
+                    'streaming_supported': wireless and model in ('f87', 'f75'),
+                    'supported_effects': list(F75_CD.effects if model == 'f75' else F87.effects)}
 
         class KeyboardContext:
             def __init__(self, path, model):
@@ -150,11 +160,17 @@ class SelectorCallbackTests(unittest.TestCase):
 
             def __init__(self, *args, device, model, **kwargs):
                 self.device, self.model = device, model
+                self.effect = kwargs.get('effect', 'aurora')
+                self.profile = F75_CD if model == 'f75' else F87
+                self.level = args[1]
+                sessions.append(self)
                 self.running = True
                 self.stopped = threading.Event()
 
             def start(self):
-                return {**state(self.device, self.model), 'effect': 'aurora', 'streaming': True,
+                return {**state(self.device, self.model), 'effect': self.effect, 'streaming': True,
+                        'brightness': self.level, 'brightness_max': 4,
+                        'onboard_brightness_max': self.profile.brightness_max,
                         'typing_reactions': False, 'backup': '/tmp/simulated-backup.json'}
 
             def request_stop(self):
@@ -191,6 +207,10 @@ class SelectorCallbackTests(unittest.TestCase):
                 self_test.assertNotEqual(('stop', radio.path), events[-1])
                 drain()
                 self_test.assertEqual([('stop', radio.path), ('connect', wired.path, None)], events[-2:])
+                self_test.assertNotIn('Aurora + key ripples', effect.model)
+                brightness = widgets['SpinButton'][0]
+                self_test.assertEqual((0, 9), brightness.properties['range'])
+                self_test.assertEqual(8, brightness.get_value())
                 self_test.assertEqual(1, dropdown.model_changes)
                 restore = next(button for button in widgets['Button']
                                if button.properties.get('label') == 'Restore previous settings')
@@ -202,6 +222,20 @@ class SelectorCallbackTests(unittest.TestCase):
                 self_test.assertEqual(1, dropdown.model_changes)
                 drain()
                 self_test.assertEqual(2, dropdown.model_changes)
+                dropdown.set_selected(2)
+                drain()
+                model_row.set_selected(2)
+                drain()
+                self_test.assertEqual(('connect', radio.path, 'f75'), events[-1])
+                self_test.assertEqual((0, 9), brightness.properties['range'])
+                self_test.assertIn('Solid color over dongle', effect.model)
+                self_test.assertIn('Aurora + key ripples', effect.model)
+                self_test.assertEqual('Aurora (onboard)', effect.model[effect.get_selected()])
+                effect.set_selected(effect.model.index('Solid color over dongle'))
+                drain()
+                self_test.assertEqual(4, sessions[-1].level)
+                self_test.assertEqual((0, 4), brightness.properties['range'])
+                self_test.assertEqual(4, brightness.get_value())
                 status = next(label for label in widgets['Label'] if label.properties.get('selectable'))
                 self_test.assertNotIn('error', status.css_classes)
                 return 0

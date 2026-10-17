@@ -12,14 +12,19 @@ from aula import ANIMATED_EFFECTS, EFFECT_LABELS, parse_color
 from keyboard_device import DeviceSelection, device_options, connect_keyboard as Keyboard
 from aula_live import LatestChangeQueue
 from aula_aurora import LIVE_HINTS, LIVE_LABELS, LAYOUT, LiveSession
+from keyboard_profiles import F87_EFFECTS
 
 
 PROJECTIONS = {"video", "screen"}
+PAIRED_MODELS = (None, 'f87', 'f75')
 
 
-def panel_effects(transport):
-    labels = {**EFFECT_LABELS, **LIVE_LABELS}
-    labels.pop("solid" if transport == "wireless-2.4g" else "wireless-solid")
+def panel_effects(transport, streaming_supported=True, supported_effects=None):
+    labels = {name: EFFECT_LABELS[name] for name in
+              (F87_EFFECTS if supported_effects is None else supported_effects)}
+    if streaming_supported:
+        labels.update(LIVE_LABELS)
+    labels.pop("solid" if transport == "wireless-2.4g" else "wireless-solid", None)
     return labels
 
 
@@ -27,6 +32,15 @@ def projection_status(result):
     return (f"{LIVE_LABELS[result['effect']]} is live.\n{result['source']}\n"
             f"Source: {result['capture_fps']} FPS · Keyboard: {result['usb_fps']} FPS\n"
             "Frames stay local and are never saved.")
+
+
+def animation_status(result):
+    reactions = (LIVE_HINTS[result['effect']]
+                 if result['typing_reactions'] or result['effect'] == 'wireless-solid' else
+                 'Animation is running. Keypress access is unavailable.')
+    return (f"{LIVE_LABELS[result['effect']]} is live.\n"
+            f"Keyboard: {result.get('usb_fps', 0)} FPS · Target: {result.get('target_fps', 4)} FPS\n"
+            f"{reactions}\nTyping is never saved.")
 
 
 def draw_keyboard(context, width, height, colors, layout=LAYOUT):
@@ -100,7 +114,7 @@ def run(device=None, model=None):
         connection_group = Adw.PreferencesGroup()
         paired_model = Adw.ComboRow(title="Paired keyboard",
             subtitle="The dongle cannot detect its model. Select the keyboard you own.",
-            model=Gtk.StringList.new(["Read-only inspection", "AULA F87 (experimental)"]))
+            model=Gtk.StringList.new(["Read-only inspection", "AULA F87 (experimental)", "AULA F75 (experimental)"]))
         connection_group.add(paired_model)
         connection_group.set_visible(False)
         page.append(connection_group)
@@ -212,6 +226,8 @@ def run(device=None, model=None):
         closing = [False]
         writable = [False]
         wireless = [False]
+        onboard_brightness_max = [4]
+        target_fps = [25]
         selecting = [False]
         connection_pending = [False]
         rebuild_pending = [False]
@@ -224,7 +240,7 @@ def run(device=None, model=None):
                 paths = [item.path for item in connection.options]
                 devices.set_selected(paths.index(connection.device) + 1 if connection.device in paths else 0)
                 connection_group.set_visible(connection.wireless)
-                paired_model.set_selected(1 if connection.model == 'f87' else 0)
+                paired_model.set_selected(PAIRED_MODELS.index(connection.model))
                 devices.set_tooltip_text(str(connection.device) if connection.device else
                                          "Choose the keyboard or wireless dongle to control")
             finally:
@@ -269,7 +285,7 @@ def run(device=None, model=None):
         def choose_model(*_):
             if selecting[0] or busy[0] or not connection.wireless:
                 return
-            connection.choose_model('f87' if paired_model.get_selected() == 1 else None)
+            connection.choose_model(PAIRED_MODELS[paired_model.get_selected()])
             queue_connection_change()
 
         def scan_devices(*_):
@@ -285,6 +301,14 @@ def run(device=None, model=None):
             selected = effect_names[index]
             is_live = selected in LIVE_LABELS
             is_projection = selected in PROJECTIONS
+            previous_sync = syncing[0]
+            syncing[0] = True
+            try:
+                maximum = 4 if is_live else onboard_brightness_max[0]
+                brightness.set_range(0, maximum)
+                bright_row.set_subtitle(f"0 turns the backlight off; {maximum} is brightest")
+            finally:
+                syncing[0] = previous_sync
             video_row.set_visible(selected == "video")
             screen_row.set_visible(selected == "screen")
             vivid_row.set_visible(is_projection)
@@ -298,8 +322,7 @@ def run(device=None, model=None):
             speed_row.set_sensitive(selected in ANIMATED_EFFECTS or
                                     is_live and not is_projection and selected != "wireless-solid")
             speed_row.set_subtitle("Video plays at its original speed" if selected == "video" else
-                                   "Wireless keyboard targets 4 FPS" if selected == "screen" and wireless[0] else
-                                   "Smooth capture targets 25 FPS" if selected == "screen" else
+                                   f"Keyboard targets {target_fps[0]} FPS" if selected == "screen" else
                                    "Used by animated effects")
             effect.set_subtitle(LIVE_HINTS[selected] if is_live
                                 else "Press keys to see this effect" if selected in {"reactive", "ripple"}
@@ -333,10 +356,12 @@ def run(device=None, model=None):
                     return GLib.SOURCE_REMOVE
                 writable[0] = result.get("writable", False)
                 wireless[0] = result.get("transport") == "wireless-2.4g"
+                target_fps[0] = result.get("target_fps") or (4 if wireless[0] else 25)
+                onboard_brightness_max[0] = result.get("onboard_brightness_max", result.get("brightness_max", 4))
                 group.set_sensitive(writable[0])
                 description.set_text(result.get("model") or "Keyboard lighting")
                 if not writable[0]:
-                    message = ("Choose AULA F87 in Paired keyboard if that is your keyboard."
+                    message = ("Choose your model in Paired keyboard."
                                if wireless[0] else result.get('note', 'Read-only device'))
                     status.set_text(f"{result['model']}\n{message}\n{result['device']}")
                     refresh.set_sensitive(True)
@@ -344,13 +369,17 @@ def run(device=None, model=None):
                     return GLib.SOURCE_REMOVE
                 if "backup" in result:
                     last_backup[0] = result["backup"]
-                labels = panel_effects(result.get("transport"))
+                labels = panel_effects(result.get("transport"), result.get("streaming_supported", True),
+                                       result.get("supported_effects"))
                 if effect_names != list(labels):
                     syncing[0] = True
                     effect_names[:] = labels
                     effect.set_model(Gtk.StringList.new(list(labels.values())))
                 if sync_controls:
                     syncing[0] = True
+                    maximum = result.get("brightness_max", 4)
+                    brightness.set_range(0, maximum)
+                    bright_row.set_subtitle(f"0 turns the backlight off; {maximum} is brightest")
                     known = {name: index for index, name in enumerate(effect_names)}
                     if result["effect"] in known:
                         effect.set_selected(known[result["effect"]])
@@ -365,10 +394,7 @@ def run(device=None, model=None):
                     if result["effect"] in PROJECTIONS:
                         status.set_text(projection_status(result))
                     else:
-                        reactions = (LIVE_HINTS[result["effect"]]
-                                 if result["typing_reactions"] or result["effect"] == "wireless-solid" else
-                                 "Animation is running. Keypress access is unavailable.")
-                        status.set_text(f"{LIVE_LABELS[result['effect']]} is live.\n{reactions}\nTyping is never saved.")
+                        status.set_text(animation_status(result))
                 else:
                     status.set_text(f"{success}\n{result['model']} · {result['effect']}\n{result['device']}")
             except Exception as error:
@@ -512,9 +538,11 @@ def run(device=None, model=None):
             if session and session.error and not busy[0]:
                 status.add_css_class("error")
                 status.set_text(session.error)
-            elif session and session.running and session.effect in PROJECTIONS and not busy[0]:
+            elif session and session.running and not busy[0]:
                 try:
-                    status.set_text(projection_status(session.state()))
+                    result = session.state()
+                    status.set_text(projection_status(result) if session.effect in PROJECTIONS else
+                                    animation_status(result))
                 except Exception as error:
                     status.add_css_class("error")
                     status.set_text(str(error))

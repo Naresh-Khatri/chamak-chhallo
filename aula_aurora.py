@@ -198,6 +198,11 @@ class LiveSession:
                 "profile": self.profile.key if self.profile else None,
                 "transport": self.transport,
                 "writable": bool(self.profile and self.profile.writable),
+                "streaming_supported": bool(self.profile and self.profile.streaming_supported),
+                "brightness_max": 4,
+                "onboard_brightness_max": self.profile.brightness_max if self.profile else 4,
+                "target_fps": self.profile.fps if self.profile else None,
+                "supported_effects": list(self.profile.effects) if self.profile else [],
                 "source": source_label if self.image_source else None,
                 "capture_fps": self.image_source.fps() if self.image_source else None,
                 "usb_fps": usb_fps,
@@ -214,7 +219,7 @@ class LiveSession:
     def start(self):
         self.thread = threading.Thread(target=self._run, name=f"aula-{self.effect}", daemon=True)
         self.thread.start()
-        timeout = self.image_source.startup_timeout + 2 if self.image_source else 6
+        timeout = self.image_source.startup_timeout + 30 if self.image_source else 30
         if not self.ready.wait(timeout):
             self.stop()
             raise DeviceError(f"{LIVE_LABELS[self.effect]} startup timed out.")
@@ -228,7 +233,7 @@ class LiveSession:
     def stop(self):
         self.request_stop()
         if self.thread:
-            self.thread.join(6)
+            self.thread.join(10)
             if self.thread.is_alive():
                 raise DeviceError("Waiting for the keyboard to finish its USB operation.")
         if self.error:
@@ -250,6 +255,8 @@ class LiveSession:
             with Keyboard(self.selected_device, model=self.selected_model) as keyboard:
                 keyboard.require_writable()
                 self.profile = keyboard.profile
+                if not self.profile.streaming_supported:
+                    raise DeviceError("Live streaming is not enabled for this keyboard revision.")
                 self.transport = keyboard.identification()['transport']
                 layout = self.profile.layout
                 if self.image_source:
@@ -265,8 +272,8 @@ class LiveSession:
                 config, palette = keyboard.read_config(), keyboard.read_palette()
                 self.backup = keyboard.backup(config, palette)
                 self.device = keyboard.path
-                keyboard.start_stream(config)
                 try:
+                    keyboard.start_stream(config)
                     if not self.image_source and self.effect != 'wireless-solid':
                         inputs = KeyInput(layout=layout, usb_parent=keyboard.usb_parent,
                                           usb_id=keyboard.identification()['usb_id'])
